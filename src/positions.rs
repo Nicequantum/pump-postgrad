@@ -1,4 +1,4 @@
-//! Open position lifecycle — Jupiter buy, monitor PnL, fast exit.
+//! Position execution and lifecycle — buys, sells, PnL monitoring (no strategy logic).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,16 +9,14 @@ use parking_lot::RwLock;
 use serde::Serialize;
 use solana_sdk::signature::Signature;
 use solana_sdk::signer::Signer;
-use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::PostGradConfig;
 use crate::execution::rpc::SignaturePoll;
 use crate::execution::{JupiterSwap, RpcClient, TradingWallet};
 use crate::parser::TradeEvent;
 use crate::store::PostGradStores;
-use crate::strategy::EntryDecision;
-use crate::tracker::{GraduationCandidate, PostGradTracker};
+use crate::strategy::{EntryDecision, ExitStrategy, PositionView};
 use crate::types::{ExitReason, TradeSide};
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,13 +70,27 @@ struct OpenPosition {
     last_snapshot_ms: u64,
 }
 
+impl OpenPosition {
+    fn to_view(&self) -> PositionView {
+        PositionView {
+            mint: self.mint.clone(),
+            entry_ms: self.entry_ms,
+            entry_sol_lamports: self.entry_sol_lamports,
+            token_amount: self.token_amount,
+            peak_pnl_pct: self.peak_pnl_pct,
+            post_grad_sell_count: self.post_grad_sell_count,
+            post_grad_sell_lamports: self.post_grad_sell_lamports,
+        }
+    }
+}
+
 pub struct PositionManager {
     cfg: Arc<PostGradConfig>,
     stores: Arc<PostGradStores>,
     wallet: Arc<TradingWallet>,
     rpc: Arc<RpcClient>,
     jupiter: Arc<JupiterSwap>,
-    tracker: Arc<PostGradTracker>,
+    exit_strategy: ExitStrategy,
     open: RwLock<HashMap<String, OpenPosition>>,
 }
 
@@ -89,15 +101,14 @@ impl PositionManager {
         wallet: Arc<TradingWallet>,
         rpc: Arc<RpcClient>,
         jupiter: Arc<JupiterSwap>,
-        tracker: Arc<PostGradTracker>,
     ) -> Self {
         Self {
+            exit_strategy: ExitStrategy::new(cfg.clone()),
             cfg,
             stores,
             wallet,
             rpc,
             jupiter,
-            tracker,
             open: RwLock::new(HashMap::new()),
         }
     }
@@ -106,46 +117,11 @@ impl PositionManager {
         self.open.read().len()
     }
 
-    fn open_mint_list(&self) -> Vec<String> {
+    pub fn open_mints(&self) -> Vec<String> {
         self.open.read().keys().cloned().collect()
     }
 
-    pub async fn run_entry_loop(
-        self: Arc<Self>,
-        mut grad_rx: mpsc::Receiver<GraduationCandidate>,
-    ) {
-        while let Some(candidate) = grad_rx.recv().await {
-            let strategy = crate::strategy::EntryStrategy::new(self.cfg.clone());
-            let decision = strategy.evaluate(
-                &candidate,
-                self.open_count(),
-                &self.open_mint_list(),
-                self.tracker.entries_last_hour(),
-            );
-            let Some(decision) = decision else {
-                continue;
-            };
-
-            self.tracker.mark_entry_pending(&decision.mint);
-            tokio::time::sleep(Duration::from_millis(self.cfg.grad_snipe_delay_ms)).await;
-
-            match self.execute_entry(decision).await {
-                Ok(()) => {
-                    self.tracker.record_entry_attempt();
-                }
-                Err(e) => {
-                    error!(
-                        "entry failed {}: {:#}",
-                        &candidate.mint[..8.min(candidate.mint.len())],
-                        e
-                    );
-                }
-            }
-            self.tracker.clear_entry_pending(&candidate.mint);
-        }
-    }
-
-    async fn execute_entry(&self, decision: EntryDecision) -> anyhow::Result<()> {
+    pub async fn execute_entry(&self, decision: EntryDecision) -> anyhow::Result<()> {
         let mint = decision.mint.clone();
         let short = mint.chars().take(8).collect::<String>();
         let sol = self.cfg.buy_sol_lamports;
@@ -192,10 +168,6 @@ impl PositionManager {
             return Ok(());
         }
 
-        if !self.jupiter.has_buy_route(&mint, sol).await {
-            anyhow::bail!("no Jupiter buy route for {}", short);
-        }
-
         let balance = self
             .rpc
             .get_sol_balance(&self.wallet.keypair().pubkey())
@@ -231,7 +203,9 @@ impl PositionManager {
         {
             SignaturePoll::Confirmed => {}
             SignaturePoll::Reverted(e) => anyhow::bail!("buy tx reverted: {}", e),
-            SignaturePoll::Pending => warn!("buy tx {} not confirmed in time — checking balance", sig),
+            SignaturePoll::Pending => {
+                warn!("buy tx {} not confirmed in time — checking balance", sig)
+            }
         }
 
         let token_amount = self
@@ -322,7 +296,7 @@ impl PositionManager {
             let open = self.open.read();
             open.get(mint).cloned()
         };
-        let Some(pos) = pos else {
+        let Some(mut pos) = pos else {
             return Ok(());
         };
 
@@ -337,22 +311,21 @@ impl PositionManager {
             }
         };
 
-        let peak_pnl = {
+        {
             let mut open = self.open.write();
             if let Some(p) = open.get_mut(mint) {
                 if pnl_pct > p.peak_pnl_pct {
                     p.peak_pnl_pct = pnl_pct;
                 }
-                p.peak_pnl_pct
+                pos.peak_pnl_pct = p.peak_pnl_pct;
             } else {
                 return Ok(());
             }
-        };
+        }
 
         let should_snapshot = {
             let mut open = self.open.write();
             if let Some(p) = open.get_mut(mint) {
-                let now = crate::slot_timing::now_ms();
                 if now.saturating_sub(p.last_snapshot_ms) >= self.cfg.position_snapshot_ms {
                     p.last_snapshot_ms = now;
                     true
@@ -368,34 +341,16 @@ impl PositionManager {
                 ts: Utc::now().to_rfc3339(),
                 mint: mint.to_string(),
                 pnl_pct,
-                peak_pnl_pct: peak_pnl,
+                peak_pnl_pct: pos.peak_pnl_pct,
                 hold_secs,
                 dry_run: self.cfg.dry_run,
             });
         }
 
-        let rug_signal = pos.post_grad_sell_count >= 3
-            && pos.post_grad_sell_lamports > pos.entry_sol_lamports / 2;
-
-        let trailing_hit = peak_pnl >= self.cfg.take_profit_pct * 0.5
-            && pnl_pct <= peak_pnl - self.cfg.trailing_stop_pct;
-
-        let reason = if pnl_pct >= self.cfg.take_profit_pct {
-            Some(ExitReason::TakeProfit)
-        } else if trailing_hit {
-            Some(ExitReason::TrailingStop)
-        } else if pnl_pct <= -self.cfg.stop_loss_pct {
-            Some(ExitReason::StopLoss)
-        } else if hold_secs >= self.cfg.max_hold_secs {
-            Some(ExitReason::TimeStop)
-        } else if rug_signal {
-            Some(ExitReason::RugSignal)
-        } else {
-            None
-        };
-
-        if let Some(r) = reason {
-            self.close_position(mint, &pos, r, pnl_pct, hold_secs).await?;
+        let view = pos.to_view();
+        if let Some(r) = self.exit_strategy.evaluate(&view, pnl_pct, now) {
+            self.close_position(mint, &pos, r, pnl_pct, hold_secs)
+                .await?;
         }
         Ok(())
     }

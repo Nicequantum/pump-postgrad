@@ -13,6 +13,7 @@ use crate::config::PostGradConfig;
 pub struct PostGradStores {
     graduations: Mutex<BufWriter<File>>,
     entries: Mutex<BufWriter<File>>,
+    entry_rejects: Mutex<BufWriter<File>>,
     exits: Mutex<BufWriter<File>>,
     trades: Mutex<BufWriter<File>>,
     positions: Mutex<BufWriter<File>>,
@@ -24,6 +25,7 @@ impl PostGradStores {
         Ok(Self {
             graduations: Mutex::new(open_append(&cfg.graduations_path())?),
             entries: Mutex::new(open_append(&cfg.entries_path())?),
+            entry_rejects: Mutex::new(open_append(&cfg.entry_rejects_path())?),
             exits: Mutex::new(open_append(&cfg.exits_path())?),
             trades: Mutex::new(open_append(&cfg.trades_path())?),
             positions: Mutex::new(open_append(&cfg.positions_path())?),
@@ -37,6 +39,10 @@ impl PostGradStores {
 
     pub fn write_entry<T: Serialize>(&self, row: &T) -> Result<()> {
         write_row(&self.entries, row)
+    }
+
+    pub fn write_entry_reject<T: Serialize>(&self, row: &T) -> Result<()> {
+        write_row(&self.entry_rejects, row)
     }
 
     pub fn write_exit<T: Serialize>(&self, row: &T) -> Result<()> {

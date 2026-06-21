@@ -1,5 +1,6 @@
 //! RPC bonding-curve poller — graduation detection via complete flag.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use solana_sdk::pubkey::Pubkey;
 use tracing::warn;
 
 use crate::config::PostGradConfig;
-use crate::tracker::PostGradTracker;
+use crate::tracker::{PollCandidate, PostGradTracker};
 use crate::types::{INITIAL_VIRTUAL_TOKEN, PUMP_PROGRAM_ID};
 
 #[derive(Debug, Clone, Default)]
@@ -23,9 +24,33 @@ pub struct BondingCurveState {
     pub curve_pct: f64,
 }
 
+#[derive(Debug, Default)]
+pub struct PollerMetrics {
+    pub polls_total: AtomicU64,
+    pub polls_ok: AtomicU64,
+    pub polls_err: AtomicU64,
+    pub graduations_from_poll: AtomicU64,
+    pub rpc_retries: AtomicU64,
+}
+
+impl PollerMetrics {
+    pub fn summary(&self) -> String {
+        format!(
+            "polls={} ok={} err={} grad={} retries={}",
+            self.polls_total.load(Ordering::Relaxed),
+            self.polls_ok.load(Ordering::Relaxed),
+            self.polls_err.load(Ordering::Relaxed),
+            self.graduations_from_poll.load(Ordering::Relaxed),
+            self.rpc_retries.load(Ordering::Relaxed),
+        )
+    }
+}
+
 pub struct CurvePoller {
     client: Client,
     query_url: String,
+    retries: u32,
+    error_backoff_ms: u64,
 }
 
 impl CurvePoller {
@@ -36,6 +61,8 @@ impl CurvePoller {
                 .build()
                 .expect("curve poller http"),
             query_url: cfg.rpc_url_with_token(&cfg.query_rpc),
+            retries: cfg.poll_rpc_retries,
+            error_backoff_ms: cfg.poll_error_backoff_ms,
         }
     }
 
@@ -63,9 +90,12 @@ impl CurvePoller {
             .json()
             .await?;
 
+        if let Some(err) = resp.get("error") {
+            return Err(anyhow::anyhow!("RPC error: {}", err));
+        }
+
         let value = &resp["result"]["value"];
         if value.is_null() {
-            // Bonding curve PDA closed — token has migrated off the curve.
             return Ok(BondingCurveState {
                 complete: true,
                 curve_pct: 100.0,
@@ -90,7 +120,7 @@ impl CurvePoller {
         let virtual_tok = u64::from_le_bytes(data[cursor..cursor + 8].try_into()?);
         cursor += 8;
         let virtual_sol = u64::from_le_bytes(data[cursor..cursor + 8].try_into()?);
-        cursor += 8 + 8 + 8 + 8; // real_tok, real_sol, token_total_supply
+        cursor += 8 + 8 + 8 + 8;
         let complete = data.len() > cursor && data[cursor] == 1;
 
         let price_sol_per_token = if virtual_tok > 0 {
@@ -107,6 +137,30 @@ impl CurvePoller {
             curve_pct: curve_pct_from_reserves(virtual_tok, complete),
         })
     }
+
+    pub async fn poll_with_retry(
+        &self,
+        mint: &Pubkey,
+        metrics: &PollerMetrics,
+    ) -> Result<BondingCurveState> {
+        let mut last_err = anyhow::anyhow!("poll not attempted");
+        for attempt in 1..=self.retries.max(1) {
+            match self.get_bonding_curve_state(mint).await {
+                Ok(state) => return Ok(state),
+                Err(e) => {
+                    last_err = e;
+                    if attempt < self.retries {
+                        metrics.rpc_retries.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(
+                            self.error_backoff_ms * attempt as u64,
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
 }
 
 pub fn curve_pct_from_reserves(virtual_token: u64, complete: bool) -> f64 {
@@ -120,38 +174,62 @@ pub fn curve_pct_from_reserves(virtual_token: u64, complete: bool) -> f64 {
     ((INITIAL_VIRTUAL_TOKEN - vt) / INITIAL_VIRTUAL_TOKEN * 100.0).clamp(0.0, 100.0)
 }
 
-pub async fn run_curve_poller(cfg: Arc<PostGradConfig>, tracker: Arc<PostGradTracker>) {
+pub async fn run_curve_poller(
+    cfg: Arc<PostGradConfig>,
+    tracker: Arc<PostGradTracker>,
+    metrics: Arc<PollerMetrics>,
+) {
     let poller = CurvePoller::new(&cfg);
     let interval = Duration::from_millis(cfg.poll_interval_ms);
+    let per_mint_delay = Duration::from_millis(cfg.poll_per_mint_delay_ms);
+    let prune_interval = Duration::from_secs(cfg.tracker_prune_interval_secs);
+    let mut last_prune = std::time::Instant::now();
+
     loop {
         tokio::time::sleep(interval).await;
-        let mints = tracker.mints_for_poll();
-        if mints.is_empty() {
+
+        if last_prune.elapsed() >= prune_interval {
+            tracker.prune_stale();
+            last_prune = std::time::Instant::now();
+        }
+
+        let candidates = tracker.mints_for_poll();
+        if candidates.is_empty() {
             continue;
         }
-        for chunk in mints.chunks(cfg.poll_batch_size) {
-            for mint_str in chunk {
-                let Ok(mint_pk) = mint_str.parse::<Pubkey>() else {
+
+        for chunk in candidates.chunks(cfg.poll_batch_size) {
+            for PollCandidate { mint, .. } in chunk {
+                let Ok(mint_pk) = mint.parse::<Pubkey>() else {
                     continue;
                 };
-                match poller.get_bonding_curve_state(&mint_pk).await {
+                metrics.polls_total.fetch_add(1, Ordering::Relaxed);
+                match poller.poll_with_retry(&mint_pk, &metrics).await {
                     Ok(curve) => {
+                        metrics.polls_ok.fetch_add(1, Ordering::Relaxed);
+                        let was_complete = curve.complete;
                         tracker.on_curve_poll(
-                            mint_str,
+                            mint,
                             curve.curve_pct,
                             curve.price_sol_per_token,
                             curve.complete,
                         );
+                        if was_complete {
+                            metrics
+                                .graduations_from_poll
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     Err(e) => {
+                        metrics.polls_err.fetch_add(1, Ordering::Relaxed);
                         warn!(
                             "curve poll {}: {}",
-                            &mint_str[..8.min(mint_str.len())],
+                            &mint[..8.min(mint.len())],
                             e
                         );
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                tokio::time::sleep(per_mint_delay).await;
             }
         }
     }

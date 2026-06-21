@@ -19,9 +19,14 @@ pub struct PostGradConfig {
 
     pub poll_interval_ms: u64,
     pub poll_batch_size: usize,
+    pub poll_per_mint_delay_ms: u64,
+    pub poll_rpc_retries: u32,
+    pub poll_error_backoff_ms: u64,
     pub min_curve_pct_to_watch: f64,
+    pub min_curve_pct_complete: f64,
     pub max_tracked_tokens: usize,
     pub token_activity_ttl_secs: u64,
+    pub tracker_prune_interval_secs: u64,
 
     pub buy_sol_lamports: u64,
     pub min_wallet_sol_lamports: u64,
@@ -34,8 +39,11 @@ pub struct PostGradConfig {
     pub min_unique_buyers: u32,
     pub min_unique_buyers_migrate: u32,
     pub min_buy_sell_ratio: f64,
+    pub min_trades_curve_complete: u32,
     pub max_positions_per_hour: u32,
     pub grad_dedup_secs: u64,
+    pub rug_min_sell_count: u32,
+    pub rug_sell_lamport_divisor: u64,
 
     pub jupiter_api_key: String,
     pub buy_slippage_bps: u32,
@@ -48,6 +56,9 @@ pub struct PostGradConfig {
     pub position_snapshot_ms: u64,
     pub ingest_reconnect_delay_ms: u64,
     pub ingest_max_reconnect_ms: u64,
+    pub ingest_channel_capacity: usize,
+    pub ingest_stall_warn_secs: u64,
+    pub grad_channel_capacity: usize,
     pub max_grad_age_ms: u64,
     pub jupiter_quote_retries: u32,
     pub sell_max_retries: u32,
@@ -120,9 +131,14 @@ impl PostGradConfig {
             grpc_enabled,
             poll_interval_ms: env_u64("POSTGRAD_POLL_INTERVAL_MS", 2_000),
             poll_batch_size: env_usize("POSTGRAD_POLL_BATCH_SIZE", 30),
+            poll_per_mint_delay_ms: env_u64("POSTGRAD_POLL_PER_MINT_MS", 20),
+            poll_rpc_retries: env_u32("POSTGRAD_POLL_RPC_RETRIES", 2),
+            poll_error_backoff_ms: env_u64("POSTGRAD_POLL_ERROR_BACKOFF_MS", 500),
             min_curve_pct_to_watch: env_f64("POSTGRAD_MIN_CURVE_PCT", 85.0),
+            min_curve_pct_complete: env_f64("POSTGRAD_MIN_CURVE_PCT_COMPLETE", 99.0),
             max_tracked_tokens: env_usize("POSTGRAD_MAX_TRACKED", 5_000),
             token_activity_ttl_secs: env_u64("POSTGRAD_TOKEN_TTL_SECS", 3_600),
+            tracker_prune_interval_secs: env_u64("POSTGRAD_TRACKER_PRUNE_SECS", 300),
             buy_sol_lamports: env_u64("POSTGRAD_BUY_SOL_LAMPORTS", 50_000_000),
             min_wallet_sol_lamports: env_u64("POSTGRAD_MIN_WALLET_SOL", 80_000_000),
             take_profit_pct: env_f64("POSTGRAD_TAKE_PROFIT_PCT", 25.0),
@@ -134,8 +150,11 @@ impl PostGradConfig {
             min_unique_buyers: env_u32("POSTGRAD_MIN_UNIQUE_BUYERS", 15),
             min_unique_buyers_migrate: env_u32("POSTGRAD_MIN_UNIQUE_BUYERS_MIGRATE", 8),
             min_buy_sell_ratio: env_f64("POSTGRAD_MIN_BUY_SELL_RATIO", 1.5),
+            min_trades_curve_complete: env_u32("POSTGRAD_MIN_TRADES_CURVE_COMPLETE", 25),
             max_positions_per_hour: env_u32("POSTGRAD_MAX_POSITIONS_PER_HOUR", 12),
             grad_dedup_secs: env_u64("POSTGRAD_GRAD_DEDUP_SECS", 300),
+            rug_min_sell_count: env_u32("POSTGRAD_RUG_MIN_SELL_COUNT", 3),
+            rug_sell_lamport_divisor: env_u64("POSTGRAD_RUG_SELL_LAMPORT_DIV", 2),
             jupiter_api_key: std::env::var("JUPITER_API_KEY").unwrap_or_default(),
             buy_slippage_bps: env_u32("POSTGRAD_BUY_SLIPPAGE_BPS", 3000),
             sell_slippage_bps: env_u32("POSTGRAD_SELL_SLIPPAGE_BPS", 5000),
@@ -146,6 +165,9 @@ impl PostGradConfig {
             position_snapshot_ms: env_u64("POSTGRAD_POSITION_SNAPSHOT_MS", 5_000),
             ingest_reconnect_delay_ms: env_u64("POSTGRAD_INGEST_RECONNECT_MS", 3_000),
             ingest_max_reconnect_ms: env_u64("POSTGRAD_INGEST_MAX_RECONNECT_MS", 60_000),
+            ingest_channel_capacity: env_usize("POSTGRAD_INGEST_CHANNEL", 4096),
+            ingest_stall_warn_secs: env_u64("POSTGRAD_INGEST_STALL_SECS", 30),
+            grad_channel_capacity: env_usize("POSTGRAD_GRAD_CHANNEL", 512),
             max_grad_age_ms: env_u64("POSTGRAD_MAX_GRAD_AGE_MS", 30_000),
             jupiter_quote_retries: env_u32("POSTGRAD_JUPITER_QUOTE_RETRIES", 3),
             sell_max_retries: env_u32("POSTGRAD_SELL_MAX_RETRIES", 3),
@@ -165,8 +187,29 @@ impl PostGradConfig {
                 self.sol_reserve_lamports
             );
         }
+        if self.take_profit_pct <= 0.0 || self.stop_loss_pct <= 0.0 {
+            bail!("take_profit and stop_loss must be > 0");
+        }
+        if self.trailing_stop_pct <= 0.0 || self.trailing_stop_pct >= self.take_profit_pct {
+            bail!("trailing_stop must be > 0 and < take_profit");
+        }
+        if self.buy_slippage_bps == 0 || self.buy_slippage_bps > 10_000 {
+            bail!("POSTGRAD_BUY_SLIPPAGE_BPS must be in (0, 10000]");
+        }
+        if self.sell_slippage_bps == 0 || self.sell_slippage_bps > 10_000 {
+            bail!("POSTGRAD_SELL_SLIPPAGE_BPS must be in (0, 10000]");
+        }
+        if self.max_open_positions == 0 {
+            bail!("POSTGRAD_MAX_OPEN_POSITIONS must be > 0");
+        }
+        if self.min_curve_pct_to_watch < 0.0 || self.min_curve_pct_to_watch > 100.0 {
+            bail!("POSTGRAD_MIN_CURVE_PCT must be in [0, 100]");
+        }
         if self.grpc_enabled && self.shredstream_auth_token.is_empty() {
             bail!("SHREDSTREAM_AUTH_TOKEN required for gRPC ingest");
+        }
+        if self.ingest_channel_capacity == 0 || self.grad_channel_capacity == 0 {
+            bail!("ingest and grad channel capacities must be > 0");
         }
         if !self.dry_run && self.jupiter_api_key.is_empty() {
             tracing::warn!("JUPITER_API_KEY empty — swap API may rate-limit or reject");
@@ -185,6 +228,10 @@ impl PostGradConfig {
 
     pub fn entries_path(&self) -> PathBuf {
         self.data_dir.join("entries.jsonl")
+    }
+
+    pub fn entry_rejects_path(&self) -> PathBuf {
+        self.data_dir.join("entry_rejects.jsonl")
     }
 
     pub fn exits_path(&self) -> PathBuf {
@@ -211,6 +258,19 @@ impl PostGradConfig {
         } else {
             format!("{}?api_key={}", base, self.solana_rpc_token)
         }
+    }
+
+    pub fn summary_line(&self) -> String {
+        format!(
+            "dry_run={} buy={}lam tp={}% sl={}% max_open={} poll={}ms ingest_ch={}",
+            self.dry_run,
+            self.buy_sol_lamports,
+            self.take_profit_pct,
+            self.stop_loss_pct,
+            self.max_open_positions,
+            self.poll_interval_ms,
+            self.ingest_channel_capacity,
+        )
     }
 }
 
