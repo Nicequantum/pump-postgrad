@@ -63,7 +63,17 @@ impl CurvePoller {
             .json()
             .await?;
 
-        let data_b64 = resp["result"]["value"]["data"][0]
+        let value = &resp["result"]["value"];
+        if value.is_null() {
+            // Bonding curve PDA closed — token has migrated off the curve.
+            return Ok(BondingCurveState {
+                complete: true,
+                curve_pct: 100.0,
+                ..Default::default()
+            });
+        }
+
+        let data_b64 = value["data"][0]
             .as_str()
             .context("missing account data")?;
         let data = base64::engine::general_purpose::STANDARD.decode(data_b64)?;
@@ -71,6 +81,7 @@ impl CurvePoller {
         if data.len() < 49 {
             return Ok(BondingCurveState {
                 complete: true,
+                curve_pct: 100.0,
                 ..Default::default()
             });
         }

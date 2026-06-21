@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use crate::config::PostGradConfig;
 use crate::parser::{GraduationEvent, LaunchEvent, TradeEvent};
 use crate::store::PostGradStores;
-use crate::types::{GraduationSource, TradeSide};
+use crate::types::{is_plausible_mint, GraduationSource, TradeSide};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GraduationRecord {
@@ -57,6 +57,7 @@ struct TokenState {
     unique_buyers: HashSet<String>,
     curve_pct: f64,
     graduated: bool,
+    grad_source: Option<GraduationSource>,
     last_activity: Instant,
     last_grad_attempt: Option<Instant>,
 }
@@ -73,6 +74,7 @@ impl TokenState {
             unique_buyers: HashSet::new(),
             curve_pct: 0.0,
             graduated: false,
+            grad_source: None,
             last_activity: Instant::now(),
             last_grad_attempt: None,
         }
@@ -191,28 +193,34 @@ impl PostGradTracker {
         signature: &str,
         slot: u64,
     ) {
+        if !is_plausible_mint(mint) {
+            return;
+        }
         self.ensure_token(mint, "", grad_ms);
         let entry = self.tokens.get(mint).expect("token exists after ensure");
         let mut s = entry.write();
 
         if s.graduated {
-            return;
+            if let Some(existing) = s.grad_source {
+                if source.priority() <= existing.priority() {
+                    return;
+                }
+            } else {
+                return;
+            }
         }
 
         let dedup = Duration::from_secs(self.cfg.grad_dedup_secs);
         if let Some(last) = s.last_grad_attempt {
-            if last.elapsed() < dedup {
+            if last.elapsed() < dedup && s.graduated {
                 return;
             }
         }
-        s.last_grad_attempt = Some(Instant::now());
 
         // Raydium swap detections only confirm tokens we were already tracking near graduation.
         if source == GraduationSource::RaydiumSwap && s.curve_pct < self.cfg.min_curve_pct_to_watch {
             return;
         }
-
-        s.graduated = true;
 
         let candidate = GraduationCandidate {
             mint: mint.to_string(),
@@ -240,29 +248,36 @@ impl PostGradTracker {
             buy_sell_ratio: candidate.buy_sell_ratio,
             trade_count: candidate.trade_count,
         };
-        let _ = self.stores.write_graduation(&record);
-        self.graduations_total.fetch_add(1, Ordering::Relaxed);
-
-        info!(
-            "🎓 GRADUATION {} | src={} | buyers={} | ratio={:.1} | trades={}",
-            &mint[..8.min(mint.len())],
-            source.as_str(),
-            candidate.unique_buyers,
-            candidate.buy_sell_ratio,
-            candidate.trade_count
-        );
-
         if self.pending_mints.read().contains(mint) {
             return;
         }
 
-        match self.grad_tx.try_send(candidate) {
+        s.last_grad_attempt = Some(Instant::now());
+        drop(s);
+
+        match self.grad_tx.try_send(candidate.clone()) {
             Ok(()) => {
+                let mut s = entry.write();
+                s.graduated = true;
+                s.grad_source = Some(source);
+                drop(s);
+
+                let _ = self.stores.write_graduation(&record);
+                self.graduations_total.fetch_add(1, Ordering::Relaxed);
                 self.entries_queued.fetch_add(1, Ordering::Relaxed);
+
+                info!(
+                    "🎓 GRADUATION {} | src={} | buyers={} | ratio={:.1} | trades={}",
+                    &mint[..8.min(mint.len())],
+                    source.as_str(),
+                    candidate.unique_buyers,
+                    candidate.buy_sell_ratio,
+                    candidate.trade_count
+                );
             }
             Err(e) => {
                 warn!(
-                    "graduation channel full for {}: {}",
+                    "graduation channel full for {} — will retry: {}",
                     &mint[..8.min(mint.len())],
                     e
                 );

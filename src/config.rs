@@ -45,7 +45,13 @@ pub struct PostGradConfig {
 
     pub heartbeat_interval_secs: u64,
     pub position_poll_ms: u64,
+    pub position_snapshot_ms: u64,
     pub ingest_reconnect_delay_ms: u64,
+    pub ingest_max_reconnect_ms: u64,
+    pub max_grad_age_ms: u64,
+    pub jupiter_quote_retries: u32,
+    pub sell_max_retries: u32,
+    pub sol_reserve_lamports: u64,
 }
 
 impl PostGradConfig {
@@ -137,13 +143,27 @@ impl PostGradConfig {
             tx_confirm_timeout_ms: env_u64("POSTGRAD_TX_CONFIRM_MS", 25_000),
             heartbeat_interval_secs: env_u64("POSTGRAD_HEARTBEAT_SECS", 30),
             position_poll_ms: env_u64("POSTGRAD_POSITION_POLL_MS", 500),
+            position_snapshot_ms: env_u64("POSTGRAD_POSITION_SNAPSHOT_MS", 5_000),
             ingest_reconnect_delay_ms: env_u64("POSTGRAD_INGEST_RECONNECT_MS", 3_000),
+            ingest_max_reconnect_ms: env_u64("POSTGRAD_INGEST_MAX_RECONNECT_MS", 60_000),
+            max_grad_age_ms: env_u64("POSTGRAD_MAX_GRAD_AGE_MS", 30_000),
+            jupiter_quote_retries: env_u32("POSTGRAD_JUPITER_QUOTE_RETRIES", 3),
+            sell_max_retries: env_u32("POSTGRAD_SELL_MAX_RETRIES", 3),
+            sol_reserve_lamports: env_u64("POSTGRAD_SOL_RESERVE_LAMPORTS", 30_000_000),
         })
     }
 
     pub fn validate(&self) -> Result<()> {
         if self.buy_sol_lamports == 0 {
             bail!("POSTGRAD_BUY_SOL_LAMPORTS must be > 0");
+        }
+        if self.min_wallet_sol_lamports < self.buy_sol_lamports.saturating_add(self.sol_reserve_lamports)
+        {
+            bail!(
+                "POSTGRAD_MIN_WALLET_SOL must cover buy + reserve ({} + {})",
+                self.buy_sol_lamports,
+                self.sol_reserve_lamports
+            );
         }
         if self.grpc_enabled && self.shredstream_auth_token.is_empty() {
             bail!("SHREDSTREAM_AUTH_TOKEN required for gRPC ingest");

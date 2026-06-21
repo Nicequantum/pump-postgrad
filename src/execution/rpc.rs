@@ -36,6 +36,19 @@ impl RpcClient {
         }
     }
 
+    pub async fn health_check(&self) -> Result<u64> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSlot",
+            "params": [{"commitment": "confirmed"}]
+        });
+        let resp: Value = self.client.post(&self.query_url).json(&body).send().await?.json().await?;
+        resp["result"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("RPC health check failed: {:?}", resp))
+    }
+
     pub async fn get_sol_balance(&self, pubkey: &Pubkey) -> Result<u64> {
         let body = json!({
             "jsonrpc": "2.0",

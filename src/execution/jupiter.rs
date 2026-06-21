@@ -6,7 +6,8 @@ use solana_sdk::signature::Signature;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::VersionedTransaction;
 use std::time::Duration;
-use tracing::info;
+use tokio::time::sleep;
+use tracing::{info, warn};
 
 use crate::config::PostGradConfig;
 use crate::execution::rpc::RpcClient;
@@ -18,6 +19,8 @@ pub struct JupiterSwap {
     buy_slippage_bps: u32,
     sell_slippage_bps: u32,
     priority_fee_lamports: u64,
+    quote_retries: u32,
+    dry_run: bool,
 }
 
 impl JupiterSwap {
@@ -31,7 +34,24 @@ impl JupiterSwap {
             buy_slippage_bps: cfg.buy_slippage_bps,
             sell_slippage_bps: cfg.sell_slippage_bps,
             priority_fee_lamports: cfg.priority_fee_lamports,
+            quote_retries: cfg.jupiter_quote_retries,
+            dry_run: cfg.dry_run,
         }
+    }
+
+    pub async fn has_buy_route(&self, mint: &str, sol_lamports: u64) -> bool {
+        self.fetch_quote(WSOL_MINT, mint, sol_lamports, self.buy_slippage_bps)
+            .await
+            .is_ok()
+    }
+
+    pub async fn has_sell_route(&self, mint: &str, amount_tokens: u64) -> bool {
+        if amount_tokens == 0 {
+            return false;
+        }
+        self.fetch_quote(mint, WSOL_MINT, amount_tokens, self.sell_slippage_bps)
+            .await
+            .is_ok()
     }
 
     pub async fn quote_tokens_out(&self, mint: &str, sol_lamports: u64) -> Result<u64> {
@@ -44,11 +64,7 @@ impl JupiterSwap {
             .unwrap_or(0))
     }
 
-    pub async fn quote_sol_out(
-        &self,
-        mint: &str,
-        amount_tokens: u64,
-    ) -> Result<u64> {
+    pub async fn quote_sol_out(&self, mint: &str, amount_tokens: u64) -> Result<u64> {
         let quote = self
             .fetch_quote(mint, WSOL_MINT, amount_tokens, self.sell_slippage_bps)
             .await?;
@@ -72,6 +88,10 @@ impl JupiterSwap {
             .as_str()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
+
+        if out_tokens == 0 {
+            return Err(anyhow::anyhow!("Jupiter buy quote returned zero tokens"));
+        }
 
         info!(
             "Jupiter buy quote: {} lamports → {} tokens ({})",
@@ -121,18 +141,42 @@ impl JupiterSwap {
             "https://api.jup.ag/swap/v1/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}&restrictIntermediateTokens=true",
             input_mint, output_mint, amount, slippage_bps
         );
-        let mut req = self.http.get(&quote_url);
-        if !self.api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", self.api_key));
+
+        let mut last_err = anyhow::anyhow!("quote not attempted");
+        for attempt in 1..=self.quote_retries.max(1) {
+            let mut req = self.http.get(&quote_url);
+            if !self.api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", self.api_key));
+            }
+            match req.send().await {
+                Ok(resp) => {
+                    let quote: serde_json::Value = resp.json().await?;
+                    if let Some(err) = quote.get("error").or_else(|| quote.get("errorCode")) {
+                        last_err = anyhow::anyhow!("Jupiter quote failed: {}", err);
+                    } else if quote.get("outAmount").is_none() {
+                        last_err = anyhow::anyhow!(
+                            "Jupiter empty quote for {}",
+                            &input_mint[..8.min(input_mint.len())]
+                        );
+                    } else {
+                        return Ok(quote);
+                    }
+                }
+                Err(e) => {
+                    last_err = anyhow::anyhow!("Jupiter quote request failed: {}", e);
+                }
+            }
+            if attempt < self.quote_retries {
+                warn!(
+                    "Jupiter quote retry {}/{} for {}",
+                    attempt,
+                    self.quote_retries,
+                    &input_mint[..8.min(input_mint.len())]
+                );
+                sleep(Duration::from_millis(250 * attempt as u64)).await;
+            }
         }
-        let quote: serde_json::Value = req.send().await?.json().await?;
-        if let Some(err) = quote.get("error").or_else(|| quote.get("errorCode")) {
-            return Err(anyhow::anyhow!("Jupiter quote failed: {}", err));
-        }
-        if quote.get("outAmount").is_none() {
-            return Err(anyhow::anyhow!("Jupiter empty quote for {}", &input_mint[..8.min(input_mint.len())]));
-        }
-        Ok(quote)
+        Err(last_err)
     }
 
     async fn execute_swap(
@@ -141,6 +185,12 @@ impl JupiterSwap {
         wallet: &Keypair,
         rpc: &RpcClient,
     ) -> Result<Signature> {
+        if self.dry_run {
+            return Err(anyhow::anyhow!(
+                "execute_swap blocked — DRY_RUN mode prevents on-chain swaps"
+            ));
+        }
+
         let swap_body = serde_json::json!({
             "quoteResponse": quote,
             "userPublicKey": wallet.pubkey().to_string(),

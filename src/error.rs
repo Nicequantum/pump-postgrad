@@ -32,4 +32,13 @@ pub enum PostGradError {
     Other(#[from] anyhow::Error),
 }
 
+impl PostGradError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            PostGradError::Rpc(_) | PostGradError::Jupiter(_) | PostGradError::Ingest(_)
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, PostGradError>;

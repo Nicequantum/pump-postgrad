@@ -69,6 +69,7 @@ struct OpenPosition {
     peak_pnl_pct: f64,
     post_grad_sell_count: u32,
     post_grad_sell_lamports: u64,
+    last_snapshot_ms: u64,
 }
 
 pub struct PositionManager {
@@ -185,15 +186,31 @@ impl PositionManager {
                     peak_pnl_pct: 0.0,
                     post_grad_sell_count: 0,
                     post_grad_sell_lamports: 0,
+                    last_snapshot_ms: crate::slot_timing::now_ms(),
                 },
             );
             return Ok(());
+        }
+
+        if !self.jupiter.has_buy_route(&mint, sol).await {
+            anyhow::bail!("no Jupiter buy route for {}", short);
         }
 
         let balance = self
             .rpc
             .get_sol_balance(&self.wallet.keypair().pubkey())
             .await?;
+        let required = self
+            .cfg
+            .buy_sol_lamports
+            .saturating_add(self.cfg.sol_reserve_lamports);
+        if balance < required {
+            anyhow::bail!(
+                "wallet balance {} lamports < required {} (buy + reserve)",
+                balance,
+                required
+            );
+        }
         if balance < self.cfg.min_wallet_sol_lamports {
             anyhow::bail!(
                 "wallet balance {} lamports < min {} lamports",
@@ -256,6 +273,7 @@ impl PositionManager {
                 peak_pnl_pct: 0.0,
                 post_grad_sell_count: 0,
                 post_grad_sell_lamports: 0,
+                last_snapshot_ms: crate::slot_timing::now_ms(),
             },
         );
 
@@ -331,14 +349,30 @@ impl PositionManager {
             }
         };
 
-        let _ = self.stores.write_position(&PositionSnapshot {
-            ts: Utc::now().to_rfc3339(),
-            mint: mint.to_string(),
-            pnl_pct,
-            peak_pnl_pct: peak_pnl,
-            hold_secs,
-            dry_run: self.cfg.dry_run,
-        });
+        let should_snapshot = {
+            let mut open = self.open.write();
+            if let Some(p) = open.get_mut(mint) {
+                let now = crate::slot_timing::now_ms();
+                if now.saturating_sub(p.last_snapshot_ms) >= self.cfg.position_snapshot_ms {
+                    p.last_snapshot_ms = now;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if should_snapshot {
+            let _ = self.stores.write_position(&PositionSnapshot {
+                ts: Utc::now().to_rfc3339(),
+                mint: mint.to_string(),
+                pnl_pct,
+                peak_pnl_pct: peak_pnl,
+                hold_secs,
+                dry_run: self.cfg.dry_run,
+            });
+        }
 
         let rug_signal = pos.post_grad_sell_count >= 3
             && pos.post_grad_sell_lamports > pos.entry_sol_lamports / 2;
@@ -349,7 +383,7 @@ impl PositionManager {
         let reason = if pnl_pct >= self.cfg.take_profit_pct {
             Some(ExitReason::TakeProfit)
         } else if trailing_hit {
-            Some(ExitReason::TakeProfit)
+            Some(ExitReason::TrailingStop)
         } else if pnl_pct <= -self.cfg.stop_loss_pct {
             Some(ExitReason::StopLoss)
         } else if hold_secs >= self.cfg.max_hold_secs {
@@ -394,21 +428,54 @@ impl PositionManager {
             if sell_amount == 0 {
                 anyhow::bail!("no tokens to sell for {}", short);
             }
-            let (sig, out) = self
-                .jupiter
-                .sell_tokens(mint, sell_amount, self.wallet.keypair(), &self.rpc)
-                .await?;
-            exit_sig = sig.to_string();
-            exit_lamports = out;
 
-            match self
-                .rpc
-                .wait_for_confirmation(&sig, self.cfg.tx_confirm_timeout_ms)
-                .await?
-            {
-                SignaturePoll::Reverted(e) => warn!("exit tx reverted {}: {}", short, e),
-                SignaturePoll::Pending => warn!("exit tx {} pending after timeout", sig),
-                SignaturePoll::Confirmed => {}
+            if !self.jupiter.has_sell_route(mint, sell_amount).await {
+                warn!("no Jupiter sell route for {} — will retry on next poll", short);
+                return Ok(());
+            }
+
+            let mut last_err = None;
+            for attempt in 1..=self.cfg.sell_max_retries.max(1) {
+                match self
+                    .jupiter
+                    .sell_tokens(mint, sell_amount, self.wallet.keypair(), &self.rpc)
+                    .await
+                {
+                    Ok((sig, out)) => {
+                        exit_sig = sig.to_string();
+                        exit_lamports = out;
+
+                        match self
+                            .rpc
+                            .wait_for_confirmation(&sig, self.cfg.tx_confirm_timeout_ms)
+                            .await?
+                        {
+                            SignaturePoll::Reverted(e) => {
+                                warn!("exit tx reverted {} (attempt {}): {}", short, attempt, e);
+                                last_err = Some(anyhow::anyhow!("reverted: {}", e));
+                            }
+                            SignaturePoll::Pending => {
+                                warn!("exit tx {} pending after timeout", sig);
+                                break;
+                            }
+                            SignaturePoll::Confirmed => {
+                                last_err = None;
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("sell attempt {} failed for {}: {:#}", attempt, short, e);
+                        last_err = Some(e);
+                    }
+                }
+                if attempt < self.cfg.sell_max_retries && exit_sig == Signature::default().to_string()
+                {
+                    tokio::time::sleep(Duration::from_millis(400 * attempt as u64)).await;
+                }
+            }
+            if exit_sig == Signature::default().to_string() {
+                return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("sell failed for {}", short)));
             }
         }
 

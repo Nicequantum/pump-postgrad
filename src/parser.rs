@@ -1,15 +1,19 @@
 //! Pump.fun + Raydium instruction parser for shred Entry batches.
 
+use std::collections::HashSet;
+
 use once_cell::sync::Lazy;
 use solana_entry::entry::Entry;
+use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
+use solana_sdk::transaction::VersionedTransaction;
 
 use crate::types::{
-    PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR, PUMP_CREATE_DISCRIMINATOR,
-    PUMP_CREATE_V2_DISCRIMINATOR, PUMP_MIGRATE_DISCRIMINATOR, PUMP_MIGRATE_V2_DISCRIMINATOR,
-    PUMP_PROGRAM_ID, PUMP_SELL_DISCRIMINATOR, PUMP_SELL_V2_DISCRIMINATOR, RAYDIUM_AMM_V4,
-    TradeSide,
+    is_plausible_mint, PUMP_BUY_DISCRIMINATOR, PUMP_BUY_V2_DISCRIMINATOR,
+    PUMP_CREATE_DISCRIMINATOR, PUMP_CREATE_V2_DISCRIMINATOR, PUMP_MIGRATE_DISCRIMINATOR,
+    PUMP_MIGRATE_V2_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_SELL_DISCRIMINATOR,
+    PUMP_SELL_V2_DISCRIMINATOR, RAYDIUM_AMM_V4, TradeSide,
 };
 
 static PUMP_PROGRAM: Lazy<Pubkey> =
@@ -66,7 +70,17 @@ fn ix_discriminator(data: &[u8]) -> Option<[u8; 8]> {
 }
 
 fn account_key(accounts: &[Pubkey], idx: usize) -> Option<String> {
-    accounts.get(idx).map(|p| p.to_string())
+    accounts
+        .get(idx)
+        .map(|p| p.to_string())
+        .filter(|m| is_plausible_mint(m))
+}
+
+fn tx_account_keys(tx: &VersionedTransaction) -> Vec<Pubkey> {
+    match &tx.message {
+        VersionedMessage::Legacy(msg) => msg.account_keys.clone(),
+        VersionedMessage::V0(msg) => msg.account_keys.clone(),
+    }
 }
 
 fn trade_mint(accounts: &[Pubkey], ix_accounts: &[u8]) -> Option<String> {
@@ -100,6 +114,12 @@ fn amount_after_discriminator(data: &[u8]) -> Option<u64> {
 }
 
 /// Raydium AMM v4 swap: tag 9/11. Mint is account index 15 (coin_mint) in standard layout.
+fn push_graduation(out: &mut ParsedBatch, seen: &mut HashSet<String>, grad: GraduationEvent) {
+    if seen.insert(grad.mint.clone()) {
+        out.graduations.push(grad);
+    }
+}
+
 fn raydium_swap_mint(accounts: &[Pubkey], ix_accounts: &[u8]) -> Option<String> {
     const COIN_MINT_IX: usize = 15;
     if let Some(&idx) = ix_accounts.get(COIN_MINT_IX) {
@@ -114,6 +134,7 @@ fn raydium_swap_mint(accounts: &[Pubkey], ix_accounts: &[u8]) -> Option<String> 
 
 fn process_pump_ix(
     out: &mut ParsedBatch,
+    seen_grads: &mut HashSet<String>,
     accounts: &[Pubkey],
     ix_accounts: &[u8],
     data: &[u8],
@@ -158,7 +179,7 @@ fn process_pump_ix(
 
     if disc == PUMP_MIGRATE_DISCRIMINATOR || disc == PUMP_MIGRATE_V2_DISCRIMINATOR {
         if let Some(mint) = migrate_mint(accounts, ix_accounts) {
-            out.graduations.push(GraduationEvent {
+            push_graduation(out, seen_grads, GraduationEvent {
                 mint,
                 signature: sig.to_string(),
                 slot,
@@ -200,10 +221,11 @@ pub fn parse_entries(
 ) -> ParsedBatch {
     let mut out = ParsedBatch::default();
     let feed = feed.to_string();
+    let mut grad_mints_seen = HashSet::new();
 
     for entry in entries {
         for tx in entry.transactions {
-            let accounts = tx.message.static_account_keys();
+            let accounts = tx_account_keys(&tx);
             let sig = tx
                 .signatures
                 .first()
@@ -223,7 +245,8 @@ pub fn parse_entries(
                 if program == *PUMP_PROGRAM {
                     process_pump_ix(
                         &mut out,
-                        accounts,
+                        &mut grad_mints_seen,
+                        &accounts,
                         &ix.accounts,
                         &ix.data,
                         &trader,
@@ -238,15 +261,19 @@ pub fn parse_entries(
                 if program == *RAYDIUM_PROGRAM && !ix.data.is_empty() {
                     let tag = ix.data[0];
                     if tag == 9 || tag == 11 {
-                        if let Some(mint) = raydium_swap_mint(accounts, &ix.accounts) {
-                            out.graduations.push(GraduationEvent {
-                                mint,
-                                signature: sig.clone(),
-                                slot,
-                                receive_ms,
-                                feed: feed.clone(),
-                                source: crate::types::GraduationSource::RaydiumSwap,
-                            });
+                        if let Some(mint) = raydium_swap_mint(&accounts, &ix.accounts) {
+                            push_graduation(
+                                &mut out,
+                                &mut grad_mints_seen,
+                                GraduationEvent {
+                                    mint,
+                                    signature: sig.clone(),
+                                    slot,
+                                    receive_ms,
+                                    feed: feed.clone(),
+                                    source: crate::types::GraduationSource::RaydiumSwap,
+                                },
+                            );
                         }
                     }
                 }

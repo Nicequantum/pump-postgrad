@@ -6,7 +6,7 @@ use tracing::{info, warn};
 
 use crate::config::PostGradConfig;
 use crate::tracker::GraduationCandidate;
-use crate::types::GraduationSource;
+use crate::types::{is_plausible_mint, GraduationSource};
 
 #[derive(Debug, Clone)]
 pub struct EntryDecision {
@@ -32,6 +32,22 @@ impl EntryStrategy {
         entries_last_hour: u32,
     ) -> Option<EntryDecision> {
         let short = &candidate.mint[..8.min(candidate.mint.len())];
+
+        if !is_plausible_mint(&candidate.mint) {
+            warn!("skip {} — invalid mint address", short);
+            return None;
+        }
+
+        let grad_age_ms = crate::slot_timing::now_ms().saturating_sub(candidate.grad_ms);
+        if grad_age_ms > self.cfg.max_grad_age_ms {
+            warn!(
+                "skip {} — graduation stale ({}ms > {}ms)",
+                short,
+                grad_age_ms,
+                self.cfg.max_grad_age_ms
+            );
+            return None;
+        }
 
         if open_mints.iter().any(|m| m == &candidate.mint) {
             warn!("skip {} — already in position", short);
