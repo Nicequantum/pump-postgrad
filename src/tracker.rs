@@ -107,6 +107,8 @@ pub struct PostGradTracker {
     entries_queued: AtomicU64,
     entries_rejected: AtomicU64,
     channel_full_total: AtomicU64,
+    grad_events_seen: AtomicU64,
+    grad_skipped: AtomicU64,
     pruned_total: AtomicU64,
     recent_entry_times: RwLock<VecDeque<u64>>,
     pending_mints: RwLock<HashSet<String>>,
@@ -130,6 +132,8 @@ impl PostGradTracker {
             entries_queued: AtomicU64::new(0),
             entries_rejected: AtomicU64::new(0),
             channel_full_total: AtomicU64::new(0),
+            grad_events_seen: AtomicU64::new(0),
+            grad_skipped: AtomicU64::new(0),
             pruned_total: AtomicU64::new(0),
             recent_entry_times: RwLock::new(VecDeque::new()),
             pending_mints: RwLock::new(HashSet::new()),
@@ -174,6 +178,14 @@ impl PostGradTracker {
     }
 
     pub fn on_graduation_shred(&self, grad: GraduationEvent) {
+        self.grad_events_seen.fetch_add(1, Ordering::Relaxed);
+        let short = &grad.mint[..8.min(grad.mint.len())];
+        info!(
+            "📡 grad event {} | src={} | slot={}",
+            short,
+            grad.source.as_str(),
+            grad.slot
+        );
         self.ensure_token(&grad.mint, "", grad.receive_ms);
         self.emit_graduation(
             &grad.mint,
@@ -209,6 +221,17 @@ impl PostGradTracker {
         }
     }
 
+    fn skip_grad(&self, mint: &str, reason: &str, source: GraduationSource, curve_pct: f64) {
+        self.grad_skipped.fetch_add(1, Ordering::Relaxed);
+        info!(
+            "⏭️ grad skip {} | src={} | reason={} | curve={:.0}%",
+            &mint[..8.min(mint.len())],
+            source.as_str(),
+            reason,
+            curve_pct
+        );
+    }
+
     fn emit_graduation(
         &self,
         mint: &str,
@@ -218,21 +241,27 @@ impl PostGradTracker {
         slot: u64,
     ) {
         if !is_plausible_mint(mint) {
+            self.skip_grad(mint, "invalid_mint", source, 0.0);
             return;
         }
         self.ensure_token(mint, "", grad_ms);
         let entry = match self.tokens.get(mint) {
             Some(e) => e,
-            None => return,
+            None => {
+                self.skip_grad(mint, "token_missing", source, 0.0);
+                return;
+            }
         };
         let mut s = entry.write();
 
         if s.graduated {
             if let Some(existing) = s.grad_source {
                 if source.priority() <= existing.priority() {
+                    self.skip_grad(mint, "already_graduated", source, s.curve_pct);
                     return;
                 }
             } else {
+                self.skip_grad(mint, "already_graduated", source, s.curve_pct);
                 return;
             }
         }
@@ -240,11 +269,16 @@ impl PostGradTracker {
         let dedup = Duration::from_secs(self.cfg.grad_dedup_secs);
         if let Some(last) = s.last_grad_attempt {
             if last.elapsed() < dedup && s.graduated {
+                self.skip_grad(mint, "dedup", source, s.curve_pct);
                 return;
             }
         }
 
-        if source == GraduationSource::RaydiumSwap && s.curve_pct < self.cfg.min_curve_pct_to_watch {
+        if source == GraduationSource::RaydiumSwap
+            && !self.cfg.relaxed_filters
+            && s.curve_pct < self.cfg.min_curve_pct_to_watch
+        {
+            self.skip_grad(mint, "raydium_low_curve", source, s.curve_pct);
             return;
         }
 
@@ -280,6 +314,7 @@ impl PostGradTracker {
         };
 
         if self.pending_mints.read().contains(mint) {
+            self.skip_grad(mint, "entry_pending", source, s.curve_pct);
             return;
         }
 
@@ -328,6 +363,43 @@ impl PostGradTracker {
             .filter_map(|e| {
                 let s = e.value().read();
                 if s.graduated || s.last_activity.elapsed() >= ttl {
+                    return None;
+                }
+                Some(PollCandidate {
+                    mint: e.key().clone(),
+                    curve_pct: s.curve_pct,
+                    last_activity: s.last_activity,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.curve_pct
+                .partial_cmp(&a.curve_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out.truncate(max);
+        out
+    }
+
+    /// Near-grad + unknown-curve tokens for fast polling.
+    pub fn mints_for_aggressive_poll(&self, near_threshold: f64) -> Vec<PollCandidate> {
+        let ttl = Duration::from_secs(self.cfg.token_activity_ttl_secs);
+        let max = self.cfg.poll_batch_size.min(50);
+        let mut out: Vec<PollCandidate> = self
+            .tokens
+            .iter()
+            .filter_map(|e| {
+                let s = e.value().read();
+                if s.graduated || s.last_activity.elapsed() >= ttl {
+                    return None;
+                }
+                let near = s.curve_pct >= near_threshold;
+                let unknown = s.curve_pct == 0.0 && s.trade_count > 0;
+                if self.cfg.relaxed_filters {
+                    if !near && !unknown && s.curve_pct < near_threshold * 0.5 {
+                        return None;
+                    }
+                } else if !near {
                     return None;
                 }
                 Some(PollCandidate {
@@ -452,13 +524,15 @@ impl PostGradTracker {
             })
             .count();
         format!(
-            "active={} near_grad={} tracked={} launches={} trades={} grads={} queued={} rejected={} ch_full={} pruned={}",
+            "active={} near_grad={} tracked={} launches={} trades={} grad_events={} grads={} skipped={} queued={} rejected={} ch_full={} pruned={}",
             active,
             near_grad,
             self.tokens.len(),
             self.launches_total.load(Ordering::Relaxed),
             self.trades_total.load(Ordering::Relaxed),
+            self.grad_events_seen.load(Ordering::Relaxed),
             self.graduations_total.load(Ordering::Relaxed),
+            self.grad_skipped.load(Ordering::Relaxed),
             self.entries_queued.load(Ordering::Relaxed),
             self.entries_rejected.load(Ordering::Relaxed),
             self.channel_full_total.load(Ordering::Relaxed),

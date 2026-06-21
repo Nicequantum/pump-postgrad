@@ -12,6 +12,8 @@ pub struct PostGradConfig {
     pub solana_rpc_token: String,
     pub wallet_secret: Option<String>,
     pub dry_run: bool,
+    /// Lower entry/grad thresholds for soak testing (defaults on in DRY_RUN).
+    pub relaxed_filters: bool,
 
     pub shredstream_grpc_url: String,
     pub shredstream_auth_token: String,
@@ -22,6 +24,9 @@ pub struct PostGradConfig {
     pub poll_per_mint_delay_ms: u64,
     pub poll_rpc_retries: u32,
     pub poll_error_backoff_ms: u64,
+    pub near_grad_poll_interval_ms: u64,
+    pub near_grad_per_mint_delay_ms: u64,
+    pub near_grad_curve_pct: f64,
     pub min_curve_pct_to_watch: f64,
     pub min_curve_pct_complete: f64,
     pub max_tracked_tokens: usize,
@@ -58,6 +63,8 @@ pub struct PostGradConfig {
     pub ingest_max_reconnect_ms: u64,
     pub ingest_channel_capacity: usize,
     pub ingest_stall_warn_secs: u64,
+    pub ingest_message_timeout_secs: u64,
+    pub ingest_stall_reconnect_secs: u64,
     pub grad_channel_capacity: usize,
     pub max_grad_age_ms: u64,
     pub jupiter_quote_retries: u32,
@@ -113,6 +120,35 @@ impl PostGradConfig {
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(true);
 
+        let relaxed_filters = std::env::var("POSTGRAD_RELAXED_FILTERS")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(dry_run);
+
+        let mut min_curve_pct_to_watch = env_f64("POSTGRAD_MIN_CURVE_PCT", 85.0);
+        let mut min_curve_pct_complete = env_f64("POSTGRAD_MIN_CURVE_PCT_COMPLETE", 99.0);
+        let mut min_unique_buyers = env_u32("POSTGRAD_MIN_UNIQUE_BUYERS", 15);
+        let mut min_unique_buyers_migrate = env_u32("POSTGRAD_MIN_UNIQUE_BUYERS_MIGRATE", 8);
+        let mut min_buy_sell_ratio = env_f64("POSTGRAD_MIN_BUY_SELL_RATIO", 1.5);
+        let mut min_trades_curve_complete = env_u32("POSTGRAD_MIN_TRADES_CURVE_COMPLETE", 25);
+        let mut grad_dedup_secs = env_u64("POSTGRAD_GRAD_DEDUP_SECS", 300);
+        let mut poll_interval_ms = env_u64("POSTGRAD_POLL_INTERVAL_MS", 2_000);
+        let mut near_grad_poll_interval_ms = env_u64("POSTGRAD_NEAR_GRAD_POLL_MS", 800);
+        let near_grad_per_mint_delay_ms = env_u64("POSTGRAD_NEAR_GRAD_PER_MINT_MS", 5);
+        let mut near_grad_curve_pct = env_f64("POSTGRAD_NEAR_GRAD_CURVE_PCT", 70.0);
+
+        if relaxed_filters {
+            min_curve_pct_to_watch = min_curve_pct_to_watch.min(40.0);
+            min_curve_pct_complete = min_curve_pct_complete.min(85.0);
+            min_unique_buyers = min_unique_buyers.min(3);
+            min_unique_buyers_migrate = 0;
+            min_buy_sell_ratio = min_buy_sell_ratio.min(1.0);
+            min_trades_curve_complete = min_trades_curve_complete.min(5);
+            grad_dedup_secs = grad_dedup_secs.min(60);
+            poll_interval_ms = poll_interval_ms.min(1_000);
+            near_grad_poll_interval_ms = near_grad_poll_interval_ms.min(500);
+            near_grad_curve_pct = near_grad_curve_pct.min(50.0);
+        }
+
         Ok(Self {
             data_dir,
             lock_path: PathBuf::from(
@@ -124,18 +160,22 @@ impl PostGradConfig {
             solana_rpc_token: std::env::var("SOLANA_RPC_TOKEN").unwrap_or_default(),
             wallet_secret,
             dry_run,
+            relaxed_filters,
             shredstream_grpc_url,
             shredstream_auth_token: std::env::var("SHREDSTREAM_AUTH_TOKEN")
                 .or_else(|_| std::env::var("SHREDSTREAM_GRPC_TOKEN"))
                 .unwrap_or_default(),
             grpc_enabled,
-            poll_interval_ms: env_u64("POSTGRAD_POLL_INTERVAL_MS", 2_000),
+            poll_interval_ms,
             poll_batch_size: env_usize("POSTGRAD_POLL_BATCH_SIZE", 30),
             poll_per_mint_delay_ms: env_u64("POSTGRAD_POLL_PER_MINT_MS", 20),
             poll_rpc_retries: env_u32("POSTGRAD_POLL_RPC_RETRIES", 2),
             poll_error_backoff_ms: env_u64("POSTGRAD_POLL_ERROR_BACKOFF_MS", 500),
-            min_curve_pct_to_watch: env_f64("POSTGRAD_MIN_CURVE_PCT", 85.0),
-            min_curve_pct_complete: env_f64("POSTGRAD_MIN_CURVE_PCT_COMPLETE", 99.0),
+            near_grad_poll_interval_ms,
+            near_grad_per_mint_delay_ms,
+            near_grad_curve_pct,
+            min_curve_pct_to_watch,
+            min_curve_pct_complete,
             max_tracked_tokens: env_usize("POSTGRAD_MAX_TRACKED", 5_000),
             token_activity_ttl_secs: env_u64("POSTGRAD_TOKEN_TTL_SECS", 3_600),
             tracker_prune_interval_secs: env_u64("POSTGRAD_TRACKER_PRUNE_SECS", 300),
@@ -147,12 +187,12 @@ impl PostGradConfig {
             max_hold_secs: env_u64("POSTGRAD_MAX_HOLD_SECS", 90),
             grad_snipe_delay_ms: env_u64("POSTGRAD_SNIPE_DELAY_MS", 400),
             max_open_positions: env_usize("POSTGRAD_MAX_OPEN_POSITIONS", 3),
-            min_unique_buyers: env_u32("POSTGRAD_MIN_UNIQUE_BUYERS", 15),
-            min_unique_buyers_migrate: env_u32("POSTGRAD_MIN_UNIQUE_BUYERS_MIGRATE", 8),
-            min_buy_sell_ratio: env_f64("POSTGRAD_MIN_BUY_SELL_RATIO", 1.5),
-            min_trades_curve_complete: env_u32("POSTGRAD_MIN_TRADES_CURVE_COMPLETE", 25),
+            min_unique_buyers,
+            min_unique_buyers_migrate,
+            min_buy_sell_ratio,
+            min_trades_curve_complete,
             max_positions_per_hour: env_u32("POSTGRAD_MAX_POSITIONS_PER_HOUR", 12),
-            grad_dedup_secs: env_u64("POSTGRAD_GRAD_DEDUP_SECS", 300),
+            grad_dedup_secs,
             rug_min_sell_count: env_u32("POSTGRAD_RUG_MIN_SELL_COUNT", 3),
             rug_sell_lamport_divisor: env_u64("POSTGRAD_RUG_SELL_LAMPORT_DIV", 2),
             jupiter_api_key: std::env::var("JUPITER_API_KEY").unwrap_or_default(),
@@ -166,7 +206,9 @@ impl PostGradConfig {
             ingest_reconnect_delay_ms: env_u64("POSTGRAD_INGEST_RECONNECT_MS", 3_000),
             ingest_max_reconnect_ms: env_u64("POSTGRAD_INGEST_MAX_RECONNECT_MS", 60_000),
             ingest_channel_capacity: env_usize("POSTGRAD_INGEST_CHANNEL", 4096),
-            ingest_stall_warn_secs: env_u64("POSTGRAD_INGEST_STALL_SECS", 30),
+            ingest_stall_warn_secs: env_u64("POSTGRAD_INGEST_STALL_SECS", 20),
+            ingest_message_timeout_secs: env_u64("POSTGRAD_INGEST_MSG_TIMEOUT_SECS", 20),
+            ingest_stall_reconnect_secs: env_u64("POSTGRAD_INGEST_STALL_RECONNECT_SECS", 30),
             grad_channel_capacity: env_usize("POSTGRAD_GRAD_CHANNEL", 512),
             max_grad_age_ms: env_u64("POSTGRAD_MAX_GRAD_AGE_MS", 30_000),
             jupiter_quote_retries: env_u32("POSTGRAD_JUPITER_QUOTE_RETRIES", 3),
@@ -262,14 +304,31 @@ impl PostGradConfig {
 
     pub fn summary_line(&self) -> String {
         format!(
-            "dry_run={} buy={}lam tp={}% sl={}% max_open={} poll={}ms ingest_ch={}",
+            "dry_run={} relaxed={} buy={}lam tp={}% sl={}% max_open={} poll={}ms near_grad={}ms ingest_ch={}",
             self.dry_run,
+            self.relaxed_filters,
             self.buy_sol_lamports,
             self.take_profit_pct,
             self.stop_loss_pct,
             self.max_open_positions,
             self.poll_interval_ms,
+            self.near_grad_poll_interval_ms,
             self.ingest_channel_capacity,
+        )
+    }
+
+    pub fn diagnostics_line(&self) -> String {
+        format!(
+            "filters: min_buyers={}/{} min_ratio={:.1} min_curve_watch={:.0}% min_curve_complete={:.0}% min_trades={} grad_dedup={}s | ingest: msg_timeout={}s stall_reconnect={}s",
+            self.min_unique_buyers,
+            self.min_unique_buyers_migrate,
+            self.min_buy_sell_ratio,
+            self.min_curve_pct_to_watch,
+            self.min_curve_pct_complete,
+            self.min_trades_curve_complete,
+            self.grad_dedup_secs,
+            self.ingest_message_timeout_secs,
+            self.ingest_stall_reconnect_secs,
         )
     }
 }

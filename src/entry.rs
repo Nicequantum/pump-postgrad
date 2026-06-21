@@ -51,6 +51,14 @@ impl EntryEngine {
 
     async fn handle_candidate(&self, candidate: GraduationCandidate) {
         let short = &candidate.mint[..8.min(candidate.mint.len())];
+        info!(
+            "📥 entry engine candidate {} | src={} | buyers={} | ratio={:.1} | curve={:.0}%",
+            short,
+            candidate.source.as_str(),
+            candidate.unique_buyers,
+            candidate.buy_sell_ratio,
+            candidate.curve_pct
+        );
         let ctx = self.tracker.entry_context(self.positions.open_mints());
 
         let decision = match self.strategy.evaluate(&candidate, &ctx) {

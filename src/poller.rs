@@ -9,7 +9,7 @@ use base64::Engine as _;
 use reqwest::Client;
 use serde_json::json;
 use solana_sdk::pubkey::Pubkey;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::PostGradConfig;
 use crate::tracker::{PollCandidate, PostGradTracker};
@@ -31,17 +31,19 @@ pub struct PollerMetrics {
     pub polls_err: AtomicU64,
     pub graduations_from_poll: AtomicU64,
     pub rpc_retries: AtomicU64,
+    pub fast_poll_rounds: AtomicU64,
 }
 
 impl PollerMetrics {
     pub fn summary(&self) -> String {
         format!(
-            "polls={} ok={} err={} grad={} retries={}",
+            "polls={} ok={} err={} grad={} retries={} fast_rounds={}",
             self.polls_total.load(Ordering::Relaxed),
             self.polls_ok.load(Ordering::Relaxed),
             self.polls_err.load(Ordering::Relaxed),
             self.graduations_from_poll.load(Ordering::Relaxed),
             self.rpc_retries.load(Ordering::Relaxed),
+            self.fast_poll_rounds.load(Ordering::Relaxed),
         )
     }
 }
@@ -174,6 +176,82 @@ pub fn curve_pct_from_reserves(virtual_token: u64, complete: bool) -> f64 {
     ((INITIAL_VIRTUAL_TOKEN - vt) / INITIAL_VIRTUAL_TOKEN * 100.0).clamp(0.0, 100.0)
 }
 
+async fn poll_candidates(
+    poller: &CurvePoller,
+    tracker: &PostGradTracker,
+    metrics: &PollerMetrics,
+    candidates: &[PollCandidate],
+    per_mint_delay: Duration,
+    label: &str,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    info!(
+        "poller {} round: {} mints",
+        label,
+        candidates.len()
+    );
+    for PollCandidate { mint, curve_pct, .. } in candidates {
+        let Ok(mint_pk) = mint.parse::<Pubkey>() else {
+            continue;
+        };
+        metrics.polls_total.fetch_add(1, Ordering::Relaxed);
+        match poller.poll_with_retry(&mint_pk, metrics).await {
+            Ok(curve) => {
+                metrics.polls_ok.fetch_add(1, Ordering::Relaxed);
+                if curve.complete {
+                    metrics.graduations_from_poll.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        "curve complete {} | was {:.0}% now {:.0}%",
+                        &mint[..8.min(mint.len())],
+                        curve_pct,
+                        curve.curve_pct
+                    );
+                }
+                tracker.on_curve_poll(
+                    mint,
+                    curve.curve_pct,
+                    curve.price_sol_per_token,
+                    curve.complete,
+                );
+            }
+            Err(e) => {
+                metrics.polls_err.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "curve poll {}: {}",
+                    &mint[..8.min(mint.len())],
+                    e
+                );
+            }
+        }
+        tokio::time::sleep(per_mint_delay).await;
+    }
+}
+
+/// Run one immediate poll cycle (startup diagnostic).
+pub async fn force_initial_poll(
+    cfg: &PostGradConfig,
+    tracker: &PostGradTracker,
+    metrics: &PollerMetrics,
+) {
+    let poller = CurvePoller::new(cfg);
+    let candidates = tracker.mints_for_poll();
+    info!(
+        "startup initial poll: {} candidates tracked",
+        candidates.len()
+    );
+    poll_candidates(
+        &poller,
+        tracker,
+        metrics,
+        &candidates,
+        Duration::from_millis(cfg.poll_per_mint_delay_ms),
+        "initial",
+    )
+    .await;
+}
+
 pub async fn run_curve_poller(
     cfg: Arc<PostGradConfig>,
     tracker: Arc<PostGradTracker>,
@@ -182,55 +260,54 @@ pub async fn run_curve_poller(
     let poller = CurvePoller::new(&cfg);
     let interval = Duration::from_millis(cfg.poll_interval_ms);
     let per_mint_delay = Duration::from_millis(cfg.poll_per_mint_delay_ms);
+    let near_interval = Duration::from_millis(cfg.near_grad_poll_interval_ms);
+    let near_delay = Duration::from_millis(cfg.near_grad_per_mint_delay_ms);
     let prune_interval = Duration::from_secs(cfg.tracker_prune_interval_secs);
     let mut last_prune = std::time::Instant::now();
 
-    loop {
-        tokio::time::sleep(interval).await;
+    force_initial_poll(&cfg, &tracker, &metrics).await;
 
+    let cfg_fast = cfg.clone();
+    let tracker_fast = tracker.clone();
+    let metrics_fast = metrics.clone();
+    tokio::spawn(async move {
+        let poller_fast = CurvePoller::new(&cfg_fast);
+        loop {
+            tokio::time::sleep(near_interval).await;
+            let near = tracker_fast.mints_for_aggressive_poll(cfg_fast.near_grad_curve_pct);
+            if near.is_empty() {
+                continue;
+            }
+            metrics_fast.fast_poll_rounds.fetch_add(1, Ordering::Relaxed);
+            poll_candidates(
+                &poller_fast,
+                &tracker_fast,
+                &metrics_fast,
+                &near,
+                near_delay,
+                "fast",
+            )
+            .await;
+        }
+    });
+
+    loop {
         if last_prune.elapsed() >= prune_interval {
             tracker.prune_stale();
             last_prune = std::time::Instant::now();
         }
 
         let candidates = tracker.mints_for_poll();
-        if candidates.is_empty() {
-            continue;
-        }
+        poll_candidates(
+            &poller,
+            &tracker,
+            &metrics,
+            &candidates,
+            per_mint_delay,
+            "main",
+        )
+        .await;
 
-        for chunk in candidates.chunks(cfg.poll_batch_size) {
-            for PollCandidate { mint, .. } in chunk {
-                let Ok(mint_pk) = mint.parse::<Pubkey>() else {
-                    continue;
-                };
-                metrics.polls_total.fetch_add(1, Ordering::Relaxed);
-                match poller.poll_with_retry(&mint_pk, &metrics).await {
-                    Ok(curve) => {
-                        metrics.polls_ok.fetch_add(1, Ordering::Relaxed);
-                        let was_complete = curve.complete;
-                        tracker.on_curve_poll(
-                            mint,
-                            curve.curve_pct,
-                            curve.price_sol_per_token,
-                            curve.complete,
-                        );
-                        if was_complete {
-                            metrics
-                                .graduations_from_poll
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    Err(e) => {
-                        metrics.polls_err.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            "curve poll {}: {}",
-                            &mint[..8.min(mint.len())],
-                            e
-                        );
-                    }
-                }
-                tokio::time::sleep(per_mint_delay).await;
-            }
-        }
+        tokio::time::sleep(interval).await;
     }
 }

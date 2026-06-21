@@ -125,6 +125,7 @@ pub async fn run() -> Result<()> {
         cfg.max_hold_secs,
         cfg.max_grad_age_ms,
     );
+    info!("startup diagnostics | {}", cfg.diagnostics_line());
 
     if cfg.dry_run {
         info!("DRY_RUN=true — no on-chain transactions will be sent");

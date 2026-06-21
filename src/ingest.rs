@@ -28,30 +28,50 @@ pub struct IngestMetrics {
     pub graduations: AtomicU64,
     pub deserialize_errors: AtomicU64,
     pub reconnects: AtomicU64,
+    pub stall_reconnects: AtomicU64,
     pub channel_backpressure: AtomicU64,
     pub last_batch_ms: AtomicU64,
+    pub last_grpc_msg_ms: AtomicU64,
+    pub grpc_messages: AtomicU64,
 }
 
 impl IngestMetrics {
     pub fn summary(&self) -> String {
         format!(
-            "batches={} launches={} trades={} grads={} deser_err={} reconnects={} backpressure={}",
+            "batches={} launches={} trades={} grads={} deser_err={} grpc_msgs={} reconnects={} stall_reconnects={} backpressure={}",
             self.batches.load(Ordering::Relaxed),
             self.launches.load(Ordering::Relaxed),
             self.trades.load(Ordering::Relaxed),
             self.graduations.load(Ordering::Relaxed),
             self.deserialize_errors.load(Ordering::Relaxed),
+            self.grpc_messages.load(Ordering::Relaxed),
             self.reconnects.load(Ordering::Relaxed),
+            self.stall_reconnects.load(Ordering::Relaxed),
             self.channel_backpressure.load(Ordering::Relaxed),
         )
     }
 
     pub fn record_batch(&self) {
-        self.last_batch_ms.store(crate::slot_timing::now_ms(), Ordering::Relaxed);
+        self.last_batch_ms
+            .store(crate::slot_timing::now_ms(), Ordering::Relaxed);
+    }
+
+    pub fn record_grpc_msg(&self) {
+        self.grpc_messages.fetch_add(1, Ordering::Relaxed);
+        self.last_grpc_msg_ms
+            .store(crate::slot_timing::now_ms(), Ordering::Relaxed);
     }
 
     pub fn stall_secs(&self) -> u64 {
         let last = self.last_batch_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return 0;
+        }
+        crate::slot_timing::now_ms().saturating_sub(last) / 1000
+    }
+
+    pub fn grpc_stall_secs(&self) -> u64 {
+        let last = self.last_grpc_msg_ms.load(Ordering::Relaxed);
         if last == 0 {
             return 0;
         }
@@ -115,24 +135,6 @@ pub async fn run_ingest(
         warn!("ingest processor channel closed");
     });
 
-    let stall_cfg = cfg.clone();
-    let stall_metrics = metrics.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-            let stall = stall_metrics.stall_secs();
-            if stall >= stall_cfg.ingest_stall_warn_secs && stall_metrics.batches.load(Ordering::Relaxed) > 0
-            {
-                warn!(
-                    "ingest stall: no batches for {}s (threshold {}s)",
-                    stall,
-                    stall_cfg.ingest_stall_warn_secs
-                );
-            }
-        }
-    });
-
     if !(cfg.grpc_enabled && !cfg.shredstream_auth_token.is_empty()) {
         anyhow::bail!(
             "No ingest source — set POSTGRAD_GRPC_FALLBACK=true and SHREDSTREAM_AUTH_TOKEN in .env"
@@ -140,31 +142,32 @@ pub async fn run_ingest(
     }
 
     info!(
-        "postgrad ingest starting (grpc @ {} | channel={})",
+        "postgrad ingest starting (grpc @ {} | channel={} | msg_timeout={}s | stall_reconnect={}s)",
         cfg.shredstream_grpc_url,
-        capacity
+        capacity,
+        cfg.ingest_message_timeout_secs,
+        cfg.ingest_stall_reconnect_secs,
     );
 
     let base_delay = cfg.ingest_reconnect_delay_ms;
     let mut backoff_ms = base_delay;
     loop {
-        let result = run_grpc_entries(
-            cfg.shredstream_grpc_url.clone(),
-            cfg.shredstream_auth_token.clone(),
-            entry_tx.clone(),
-            metrics.clone(),
-            "postgrad_grpc".to_string(),
-        )
-        .await;
+        let result = run_grpc_entries(cfg.clone(), entry_tx.clone(), metrics.clone()).await;
 
         metrics.reconnects.fetch_add(1, Ordering::Relaxed);
         match &result {
             Ok(()) => {
-                warn!("gRPC stream ended cleanly — reconnecting in {}ms", base_delay);
+                warn!("gRPC stream ended — reconnecting in {}ms", base_delay);
                 backoff_ms = base_delay;
             }
             Err(e) => {
-                warn!("gRPC stream error: {:#} — reconnecting in {}ms", e, backoff_ms);
+                let is_stall = e.to_string().contains("stall");
+                if is_stall {
+                    metrics.stall_reconnects.fetch_add(1, Ordering::Relaxed);
+                    warn!("gRPC stall detected — forcing reconnect: {:#}", e);
+                } else {
+                    warn!("gRPC stream error: {:#} — reconnecting in {}ms", e, backoff_ms);
+                }
             }
         }
 
@@ -176,13 +179,17 @@ pub async fn run_ingest(
 }
 
 async fn run_grpc_entries(
-    url: String,
-    token: String,
+    cfg: Arc<PostGradConfig>,
     tx: mpsc::Sender<(Vec<Entry>, u64, u64, String)>,
     metrics: Arc<IngestMetrics>,
-    feed: String,
 ) -> Result<()> {
     use solana_stream_sdk::{CommitmentLevel, ShredstreamClient, SubscribeEntriesRequest};
+
+    let url = cfg.shredstream_grpc_url.clone();
+    let token = cfg.shredstream_auth_token.clone();
+    let feed = "postgrad_grpc".to_string();
+    let msg_timeout = Duration::from_secs(cfg.ingest_message_timeout_secs);
+    let stall_reconnect = Duration::from_secs(cfg.ingest_stall_reconnect_secs);
 
     info!("gRPC SubscribeEntries connecting @ {}", url);
     let pump_program: solana_sdk::pubkey::Pubkey =
@@ -200,26 +207,53 @@ async fn run_grpc_entries(
 
     info!("gRPC SubscribeEntries active");
     let connected_at = Instant::now();
+    let mut last_msg_at = Instant::now();
 
-    while let Ok(Some(msg)) = stream.message().await {
-        let receive_ms = crate::slot_timing::now_ms();
-        let entries: Vec<Entry> = match bincode::deserialize(&msg.entries) {
-            Ok(e) => e,
-            Err(e) => {
-                metrics.deserialize_errors.fetch_add(1, Ordering::Relaxed);
-                warn!("grpc deserialize: {}", e);
-                continue;
-            }
-        };
-        match tx.try_send((entries, msg.slot, receive_ms, feed.clone())) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(payload)) => {
-                metrics.channel_backpressure.fetch_add(1, Ordering::Relaxed);
-                if tx.send(payload).await.is_err() {
-                    break;
+    loop {
+        if last_msg_at.elapsed() >= stall_reconnect && metrics.grpc_messages.load(Ordering::Relaxed) > 0
+        {
+            return Err(anyhow::anyhow!(
+                "gRPC stall: no messages for {}s (threshold {}s)",
+                last_msg_at.elapsed().as_secs(),
+                stall_reconnect.as_secs()
+            ));
+        }
+
+        let next = tokio::time::timeout(msg_timeout, stream.message()).await;
+
+        match next {
+            Ok(Ok(Some(msg))) => {
+                last_msg_at = Instant::now();
+                metrics.record_grpc_msg();
+
+                let receive_ms = crate::slot_timing::now_ms();
+                let entries: Vec<Entry> = match bincode::deserialize(&msg.entries) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        metrics.deserialize_errors.fetch_add(1, Ordering::Relaxed);
+                        warn!("grpc deserialize: {}", e);
+                        continue;
+                    }
+                };
+                match tx.try_send((entries, msg.slot, receive_ms, feed.clone())) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(payload)) => {
+                        metrics.channel_backpressure.fetch_add(1, Ordering::Relaxed);
+                        if tx.send(payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => break,
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "gRPC message read timeout after {}s",
+                    msg_timeout.as_secs()
+                ));
+            }
         }
     }
 

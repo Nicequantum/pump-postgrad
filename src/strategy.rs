@@ -137,6 +137,21 @@ impl EntryStrategy {
             GraduationSource::CurveComplete => self.cfg.min_unique_buyers,
         };
 
+        if self.cfg.relaxed_filters
+            && matches!(
+                candidate.source,
+                GraduationSource::MigrateIx | GraduationSource::RaydiumSwap
+            )
+        {
+            info!(
+                "relaxed mode: {} src={} buyers={} (min {})",
+                short,
+                candidate.source.as_str(),
+                candidate.unique_buyers,
+                min_buyers
+            );
+        }
+
         if candidate.unique_buyers < min_buyers {
             warn!(
                 "skip {} — buyers {} < {} (src={})",
