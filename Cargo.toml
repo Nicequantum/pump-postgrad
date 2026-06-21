@@ -1,0 +1,43 @@
+[package]
+name = "pump-postgrad"
+version = "0.1.0"
+edition = "2021"
+description = "Live post-graduation Raydium sniper for Pump.fun tokens"
+authors = ["Dev"]
+license = "MIT"
+
+[[bin]]
+name = "pump-postgrad-bot"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.44", features = ["full"] }
+futures = "0.3"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = { version = "0.1", features = ["attributes"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+dotenvy = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "6.0"
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+solana-sdk = "2.2"
+solana-entry = "2.2"
+solana-client = "2.2"
+base64 = "0.22"
+bincode = "1.3"
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+solana-stream-sdk = { path = "vendor/solana-stream-sdk" }
+once_cell = "1.19"
+bs58 = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = false
+debug = true

@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package shredstream;
+
+// RPC Fast (Aperture shared plan) serves this as `shredstream.ShredstreamProxy`.
+// The gRPC method path is the dispatch key: /shredstream.ShredstreamProxy/SubscribeEntries
+// (verified via grpcurl). The service name MUST match `ShredstreamProxy` so tonic
+// generates a client that dials the correct path; otherwise the server returns
+// Unimplemented. If your endpoint exposes it as `Shredstream`, revert this one word.
+service ShredstreamProxy {
+    rpc SubscribeEntries(SubscribeEntriesRequest) returns (stream SubscribeEntriesResponse);
+}
+
+message SubscribeEntriesRequest {
+    repeated bytes accounts = 1;
+    int32 commitment = 2;
+}
+
+message SubscribeEntriesResponse {
+    // Field NUMBERS must match the server's wire format (Jito ShredStream layout), not just names.
+    // The server sends field 1 as a Varint (slot) and field 2 as length-delimited bytes (entries).
+    // Declaring `bytes entries = 1` caused: "invalid wire type: Varint (expected LengthDelimited)".
+    uint64 slot = 1;
+    bytes entries = 2;   // bincode-serialized Vec<solana_entry::entry::Entry>
+    uint64 leader_slot = 3;
+}
