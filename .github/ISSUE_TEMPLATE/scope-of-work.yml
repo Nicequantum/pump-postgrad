@@ -1,0 +1,23 @@
+name: Scope of work (agent or human)
+description: Record who asked, who owns it, who checks it, and under whose authority.
+title: "scope: "
+body:
+  - type: input
+    id: owner
+    attributes: {label: "Agent", description: "Agent or person doing the work (name and id)"}
+    validations: {required: true}
+  - type: input
+    id: reviewer
+    attributes: {label: "Cross-checked by", description: "Non-author reviewer (for example Rowan or Keiko)"}
+    validations: {required: true}
+  - type: input
+    id: authorizer
+    attributes: {label: "Authorizer card", description: "Card id, chat turn, or call id (no quotes)"}
+    validations: {required: true}
+  - type: textarea
+    id: scope
+    attributes: {label: "Scope", description: "In scope, out of scope, forbidden actions"}
+    validations: {required: true}
+  - type: input
+    id: rollback
+    attributes: {label: "Known-good / rollback target", description: "SHA, tag, or Worker version to return to"}
