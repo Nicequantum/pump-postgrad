@@ -2,7 +2,7 @@
 # Build one schemaVersion 2 audit event from the GitHub event payload (no secrets read, no network).
 # Output: $OUT_DIR/event.v2.json (full v2 record) and $OUT_DIR/event.v1-wrap.json (hub v1 envelope,
 # eventType evidence.record, carrying the v2 record until hub schemaVersion 2 is merged).
-# Privacy: PR title and body are never stored as text; only their sha256 and length are recorded.
+# Privacy: PR title and body are never stored as text; only their length is recorded.
 set -euo pipefail
 OUT_DIR=${OUT_DIR:-audit-out}; mkdir -p "$OUT_DIR"
 EV=${GITHUB_EVENT_NAME:?}; P=${GITHUB_EVENT_PATH:?}; KIND=${AUDIT_KIND:-}
@@ -22,17 +22,15 @@ case "$EV" in
   *) type=agent.action; act=$EV; key="$GITHUB_REPOSITORY|$EV|$GITHUB_RUN_ID";;
 esac
 [ -n "$KIND" ] && type=$KIND
-tsha=$(jq -j '.pull_request.title // ""' "$P" | sha256sum | cut -c1-64)
-bsha=$(jq -j '.pull_request.body // ""' "$P" | sha256sum | cut -c1-64)
 eid=$(printf '%s|%s' "$type" "$key" | sha256sum | cut -c1-64)
 body=$(jq -S -c -n --slurpfile e "$P" --arg type "$type" --arg eid "$eid" --arg ts "$ts" --arg tset "$ts_et" --arg act "$act" \
   --arg repo "$GITHUB_REPOSITORY" --arg actor "$GITHUB_ACTOR" --arg trig "${GITHUB_TRIGGERING_ACTOR:-$GITHUB_ACTOR}" \
   --arg run "$GITHUB_RUN_ID" --arg att "$GITHUB_RUN_ATTEMPT" --arg wf "$GITHUB_WORKFLOW" --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" \
-  --arg extra "${AUDIT_EXTRA:-}" --arg tsha "$tsha" --arg bsha "$bsha" '
+  --arg extra "${AUDIT_EXTRA:-}" '
   ($e[0]) as $x | ($x.pull_request // {}) as $pr |
   ($pr.body // "") as $b | ($pr.title // "") as $t |
   {schemaVersion:2, event_id:$eid, event_type:$type, ts:$ts, ts_et:$tset, ts_source:"event",
-   actor:{kind:(if ($actor|test("\\[bot\\]$")) then "bot" else "github_user" end), id:$actor, name:$actor},
+   actor:{kind:(if (($actor|test("\\[bot\\]$")) or (($x.sender.type // "") == "Bot")) then "bot" else "github_user" end), id:$actor, name:$actor},
    authorizer:null,
    correlation:{session:null, turn:null, parent:null, tool_call_id:null, source_ref:("gh-run:"+$run+"."+$att)},
    repo:$repo, pr:($pr.number // $x.workflow_run.pull_requests[0].number // null),
@@ -40,8 +38,8 @@ body=$(jq -S -c -n --slurpfile e "$P" --arg type "$type" --arg eid "$eid" --arg 
    target:($pr.base.ref // $x.workflow_run.head_branch // $ref), outcome:($x.review.state // $x.workflow_run.conclusion // $pr.state // "observed"),
    source:"github-actions",
    payload:{workflow:$wf, run_id:$run, attempt:$att, triggering_actor:$trig, ref:$ref,
-     pr_title_sha256:(if $pr.title then $tsha else null end), pr_title_len:(if $pr.title then ($t|utf8bytelength) else null end),
-     pr_body_sha256:(if $pr.body then $bsha else null end), pr_body_len:(if $pr.body then ($b|utf8bytelength) else null end), pr_author:($pr.user.login // null), draft:($pr.draft // null),
+     pr_title_len:(if $pr.title then ($t|utf8bytelength) else null end),
+     pr_body_len:(if $pr.body then ($b|utf8bytelength) else null end), pr_author:($pr.user.login // null), draft:($pr.draft // null),
      requested_reviewers:[($pr.requested_reviewers // [])[].login], reviewer:($x.review.user.login // null), review_commit:($x.review.commit_id // null),
      merged_by:($pr.merged_by.login // null),
      before:($x.before // null), forced:($x.forced // null), commits:[($x.commits // [])[] | {id, author:.author.username, verified:(.verification.verified // null)}],

@@ -1,24 +1,21 @@
 # Audit event recorder: artifact-only record (14 days). No hub emitter and no network calls in this repo.
-# PR title and body are recorded only as sha256 and length.
+# PR title and body are recorded only as length. No concurrency block: every event is recorded.
 name: audit-events
 on:
   pull_request:
-    # synchronize is omitted: branch pushes are recorded once by the push trigger.
-    types: [opened, reopened, ready_for_review, converted_to_draft, closed, edited, review_requested, labeled]
+    # PR pushes (including from forks) are recorded here as pr.pushed; read-only contents, no secrets.
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, closed, edited, review_requested, labeled]
   pull_request_review:
     types: [submitted, dismissed, edited]
   push:
-    # tags omitted: tag creation is recorded once by the create trigger.
-    branches: ['**']
+    # Default branch only, so PR pushes are not recorded twice. Tags are recorded by create.
+    branches: [main]
   release:
     types: [published, edited, deleted]
   create:
   delete:
 permissions:
   contents: read
-concurrency:
-  group: audit-events-${{ github.event_name }}-${{ github.ref }}-${{ github.sha }}-${{ github.event.action }}
-  cancel-in-progress: true
 jobs:
   record:
     runs-on: ubuntu-latest
