@@ -1,21 +1,24 @@
-# Audit and self-heal pack (Harris blanket approval, voice, Oct 29 2026 4:12 PM ET).
-# Plan: ingest-full-standard-plan-20261029.md. Sign-only by default: nothing posts unless repo vars
-# Nicequantum repo: artifact-only record (90 days); no hub emitter in this repo.
+# Audit event recorder: artifact-only record (14 days). No hub emitter and no network calls in this repo.
+# PR title and body are recorded only as sha256 and length.
 name: audit-events
 on:
   pull_request:
-    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, closed, edited, review_requested, labeled]
+    # synchronize is omitted: branch pushes are recorded once by the push trigger.
+    types: [opened, reopened, ready_for_review, converted_to_draft, closed, edited, review_requested, labeled]
   pull_request_review:
     types: [submitted, dismissed, edited]
   push:
+    # tags omitted: tag creation is recorded once by the create trigger.
     branches: ['**']
-    tags: ['**']
   release:
     types: [published, edited, deleted]
   create:
   delete:
 permissions:
   contents: read
+concurrency:
+  group: audit-events-${{ github.event_name }}-${{ github.ref }}-${{ github.sha }}-${{ github.event.action }}
+  cancel-in-progress: true
 jobs:
   record:
     runs-on: ubuntu-latest
@@ -27,9 +30,9 @@ jobs:
           sparse-checkout: .github/scripts
       - name: Build schemaVersion 2 audit event
         run: bash .github/scripts/audit-event.sh
-      - name: Upload signed-later audit record (retained 90 days)
+      - name: Upload audit record (retained 14 days)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: audit-event-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
           path: audit-out/
-          retention-days: 90
+          retention-days: 14

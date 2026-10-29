@@ -1,13 +1,10 @@
 ## Summary
 
 
-## Audit trail (parsed by audit-events.yml; keep the `Key: value` lines)
-- Agent: <agent name and id, or human>
-- Agent session: <session or chat id>
+## Audit trail (the recorder stores only a sha256 and length of this body; no internal paths or quotes)
+- Agent: <agent name, or human>
 - Scope: <one line scope of work>
-- Authorizer card: <card id / chat turn / voice call id>
+- Authorizer card: <card id / chat turn / call id>
 - Authorizer channel: <card | chat | voice | standing_rule>
-- Authorizer words: <verbatim>
-- Approver: <who said yes>
 - Cross-checked by: <non-author reviewer>
 - Known-good / rollback target: <SHA or tag>

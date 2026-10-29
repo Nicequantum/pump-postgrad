@@ -1,7 +1,6 @@
 name: Scope of work (agent or human)
 description: Record who asked, who owns it, who checks it, and under whose authority.
 title: "scope: "
-labels: ["scope"]
 body:
   - type: input
     id: owner
@@ -13,11 +12,8 @@ body:
     validations: {required: true}
   - type: input
     id: authorizer
-    attributes: {label: "Authorizer card", description: "Card id, chat turn, or voice call id of the approval"}
+    attributes: {label: "Authorizer card", description: "Card id, chat turn, or call id (no quotes)"}
     validations: {required: true}
-  - type: textarea
-    id: words
-    attributes: {label: "Authorizer words", description: "Verbatim approval words"}
   - type: textarea
     id: scope
     attributes: {label: "Scope", description: "In scope, out of scope, forbidden actions"}
